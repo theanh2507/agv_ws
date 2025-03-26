@@ -1,0 +1,105 @@
+import rclpy
+from rclpy.node import Node
+from pymodbus.client import ModbusSerialClient
+from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Quaternion
+import math
+import tf_transformations
+
+class ModbusNode(Node):
+    def __init__(self):
+        super().__init__("modbus_rtu_node")
+
+        # Khởi tạo biến
+        self.right_encoder = 0
+        self.left_encoder = 0
+        self.prev_right_encoder = 0
+        self.prev_left_encoder = 0
+
+        # Thông số robot (điều chỉnh phù hợp)
+        self.wheel_radius = 0.05   # Bán kính bánh xe (m)
+        self.wheel_base = 0.3      # Khoảng cách giữa 2 bánh xe (m)
+        self.encoder_resolution = 2048  # Số xung mỗi vòng
+
+        # Tạo Publisher cho /odom
+        self.odom_pub = self.create_publisher(Odometry, "/odom", 10)
+
+        # Kết nối Modbus RTU
+        self.declare_parameter("port", "/dev/ttyUSB0")
+        self.declare_parameter("baudrate", 9600)
+        self.declare_parameter("slave_id", 3)
+
+        self.port = self.get_parameter("port").get_parameter_value().string_value
+        self.baudrate = self.get_parameter("baudrate").get_parameter_value().integer_value
+        self.slave_id = self.get_parameter("slave_id").get_parameter_value().integer_value
+
+        self.client = ModbusSerialClient(method='rtu', port=self.port, baudrate=self.baudrate, 
+                                         parity='N', bytesize=8, stopbits=1, timeout=1)
+
+        if self.client.connect():
+            self.get_logger().info("✅ Kết nối Modbus thành công")
+        else:
+            self.get_logger().error("❌ Không thể kết nối Modbus")
+
+        # Timer đọc dữ liệu và gửi Odom mỗi 100ms (10Hz)
+        self.timer = self.create_timer(0.1, self.read_and_publish_odom)
+
+    def read_and_publish_odom(self):
+        """Đọc dữ liệu encoder và tính toán vị trí"""
+        try:
+            # Đọc encoder từ PLC
+            right_enc_response = self.client.read_holding_registers(0, count=1, slave=self.slave_id)
+            left_enc_response = self.client.read_holding_registers(1, count=1, slave=self.slave_id)
+
+            if right_enc_response.isError() or left_enc_response.isError():
+                raise ValueError("Lỗi khi đọc encoder từ PLC")
+
+            # Lấy giá trị encoder thực tế
+            self.right_encoder = right_enc_response.registers[0]
+            self.left_encoder = left_enc_response.registers[0]
+
+            # Tính delta encoder
+            delta_right = self.right_encoder - self.prev_right_encoder
+            delta_left = self.left_encoder - self.prev_left_encoder
+
+            # Cập nhật giá trị cũ
+            self.prev_right_encoder = self.right_encoder
+            self.prev_left_encoder = self.left_encoder
+
+            # Tính quãng đường từng bánh xe di chuyển
+            dist_right = (2 * math.pi * self.wheel_radius * delta_right) / self.encoder_resolution
+            dist_left = (2 * math.pi * self.wheel_radius * delta_left) / self.encoder_resolution
+
+            # Tính toán vận tốc
+            v = (dist_right + dist_left) / 2.0
+            w = (dist_right - dist_left) / self.wheel_base
+
+            # Tạo message Odometry
+            odom_msg = Odometry()
+            odom_msg.header.stamp = self.get_clock().now().to_msg()
+            odom_msg.header.frame_id = "odom"
+            odom_msg.child_frame_id = "base_link"
+
+            odom_msg.twist.twist.linear.x = v
+            odom_msg.twist.twist.angular.z = w
+
+            # Chuyển đổi góc yaw sang quaternion
+            quat = tf_transformations.quaternion_from_euler(0, 0, w)
+            odom_msg.pose.pose.orientation = Quaternion(*quat)
+
+            # Xuất dữ liệu
+            self.odom_pub.publish(odom_msg)
+            self.get_logger().info(f"📡 Gửi Odom: v={v:.3f}, w={w:.3f}")
+
+        except Exception as e:
+            self.get_logger().error(f"❌ Lỗi đọc encoder hoặc gửi Odom: {e}")
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ModbusNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
